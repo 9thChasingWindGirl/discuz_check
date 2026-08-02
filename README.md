@@ -44,7 +44,7 @@
 | `SJS_USERNAME` | 论坛账号(主认证) |
 | `SJS_PASSWORD` | 论坛密码 |
 | `SJS_COOKIE` | 备用 Cookie(账号密码登录失败时兜底) |
-| `SJS_GH_TOKEN` | (可选)GitHub fine-grained PAT,权限勾选 **Actions (Read and write)**,用于将域名列表写回仓库 Variable |
+| `SJS_GH_TOKEN` | (可选)GitHub PAT,用于将域名列表写回仓库 Variable。二选一:**fine-grained PAT**(Repository access 含本仓库,Permissions → Actions 勾选 **Read and write**)或 **classic PAT**(勾选 `repo` scope) |
 | `SJS_SMTP_HOST` | SMTP 服务器(默认 smtp.qq.com) |
 | `SJS_SMTP_PORT` | SMTP 端口(默认 465) |
 | `SJS_SMTP_SSL` | 是否 SSL(true/false) |
@@ -66,7 +66,11 @@
 
 - 种子域名只需配置一次,后续每次运行都会用最新探寻结果作为下一轮种子
 - 域名被探寻自动维护,**无需手动更新 Variable**(除非初始配置或全部域名失效)
-- **公开仓库中 `GITHUB_TOKEN` 无法写 repository variables**,需配置 Secret `SJS_GH_TOKEN`(fine-grained PAT,勾选 **Actions (Read and write)**)写回才能生效;未配置则写回仅告警跳过,**不影响签到**
+- **公开仓库中 `GITHUB_TOKEN` 无法写 repository variables**,需配置 Secret `SJS_GH_TOKEN` 写回才能生效;未配置则写回仅告警跳过,**不影响签到**
+- `SJS_GH_TOKEN` 配置要求:
+  - **fine-grained PAT**:Repository access 选择包含本仓库,Permissions → Repository permissions → **Actions: Read and write**(仅 Read 不够)
+  - **classic PAT**:勾选 **`repo`** scope
+  - 若写回仍报 `403 Resource not accessible by personal access token`,即 PAT 权限不足,请按上述要求重新创建
 - 变量不存在时工作流会自动创建;写回失败仅告警,不阻断签到结果
 
 ### 认证方式说明

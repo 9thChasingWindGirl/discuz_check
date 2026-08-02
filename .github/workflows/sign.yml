@@ -45,11 +45,20 @@ jobs:
         run: pip install -r requirements.txt
 
       # 单次调用完成全链路:账号密码登录(失败回退 Cookie)→ 域名自动探寻 → 签到/补签 → 邮件
-      # 输出 JSON(含探寻到的 domains)到 stdout 供下一步写回仓库 Variable
+      # 原始 JSON 保存到 /tmp/sign_result.json 供写回步骤使用;
+      # 日志输出可读化报告(状态行 + 多行 report),避免 \n 转义串
       - name: 执行签到
         id: sign
         run: |
-          python sijishe_api.py sign | tee /tmp/sign_result.json
+          python sijishe_api.py sign > /tmp/sign_result.json
+          python - <<'EOF'
+          import json
+          d = json.load(open('/tmp/sign_result.json', encoding='utf-8'))
+          print(f"状态: {d.get('state')} | {d.get('result')}")
+          print("----")
+          print(d.get('report', ''))
+          print("----")
+          EOF
           echo "domains=$(python -c "import json;print(','.join(json.load(open('/tmp/sign_result.json')).get('domains', [])))")" >> "$GITHUB_OUTPUT"
 
       # 将本次探寻到的域名列表写回仓库 Variable SJS_DOMAINS,供下次运行作为种子
@@ -96,5 +105,10 @@ jobs:
                   msg = e.read().decode()[:200]
                   print(f"::warning::写回 SJS_DOMAINS 失败 HTTP {e.code}: {msg}")
                   if e.code == 403:
-                      print("::warning::请配置 Secret SJS_GH_TOKEN:fine-grained PAT 勾选 Actions(Read and write) 权限")
+                      if "personal access token" in msg:
+                          print("::warning::SJS_GH_TOKEN 权限不足:fine-grained PAT 须勾选 Actions(Read and write) 且仓库访问包含本仓库;或 classic PAT 勾选 repo scope")
+                      elif "integration" in msg:
+                          print("::warning::GITHUB_TOKEN 无法写 variables:请在仓库 Settings → Secrets 配置 SJS_GH_TOKEN(fine-grained PAT 勾选 Actions Read and write)")
+                      else:
+                          print("::warning::请检查 Secret SJS_GH_TOKEN 的 Actions(Read and write) 权限")
           EOF
