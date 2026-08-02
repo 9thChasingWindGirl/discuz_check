@@ -1253,6 +1253,21 @@ def main():
     report_lines.append("-" * 30)
     report_lines.append(f"完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
+    # ---------- 状态界定 ----------
+    # 已签到:本次运行完成了签到(存在断签时已一并补签,综合结果同为"已签到")
+    # 今日已签到:今日已被签到过(非本次操作,避免同日多次触发时输出不明确)
+    # 签到失败:签到操作未成功
+    if "✅ 签到成功" in sign_result:
+        current_state = SIGN_STATE_SIGNED
+        final_result = "✅ 已签到" + ("（含补签）" if makeup_total > 0 else "")
+    elif "⏭️" in sign_result or "今日已签" in sign_result:
+        current_state = SIGN_STATE_ALREADY
+        final_result = "⏭️ 今日已签到"
+    else:
+        current_state = SIGN_STATE_FAILED
+        final_result = f"❌ 签到失败：{sign_result}"
+
+    report_lines.append(f"结果: {final_result}")
     report_content = "\n".join(report_lines)
     print()  # 空行
     for line in report_lines:
@@ -1260,11 +1275,18 @@ def main():
     print()
 
     # ---------- 邮件通知 ----------
-    if "成功" in sign_result or "已签到" in sign_result:
-        log("正在发送邮件通知...", "INFO")
-        send_mail(cfg, f"每日签到 - {datetime.now().strftime('%m/%d')}", report_content)
+    # 仅本次运行完成签到(已签到)时发送;今日已签到(重复触发)不重复发送
+    if current_state == SIGN_STATE_SIGNED:
+        email_cfg = cfg.get("email", {}) or {}
+        if not (email_cfg.get("sender") and email_cfg.get("password") and email_cfg.get("receivers")):
+            log("邮件通知: 未配置 SMTP，已跳过", "WARN")
+        else:
+            log("正在发送邮件通知...", "INFO")
+            mail_ok = send_mail(cfg, f"每日签到 - {datetime.now().strftime('%m/%d')}", report_content)
+            log("邮件通知: 已发送" if mail_ok else "邮件通知: 发送失败（请检查 SMTP 配置/授权码/网络）",
+                "OK" if mail_ok else "ERROR")
 
-    log("签到完成", "OK")
+    log(f"签到完成 - {final_result}", "OK" if current_state != SIGN_STATE_FAILED else "ERROR")
 
 
 if __name__ == "__main__":

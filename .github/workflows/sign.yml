@@ -54,10 +54,13 @@ jobs:
 
       # 将本次探寻到的域名列表写回仓库 Variable SJS_DOMAINS,供下次运行作为种子
       # 变量不存在时自动创建;写回失败不阻断签到结果,仅告警
+      # 注意:公开仓库中 GITHUB_TOKEN 无法写 repository variables,
+      #   需在仓库 Settings → Secrets 配置 SJS_GH_TOKEN(fine-grained PAT,权限: Actions Read and write);
+      #   未配置则跳过写回(不影响签到,仅域名列表不会自动更新)
       - name: 同步域名列表到仓库 Variable
         if: always() && steps.sign.outputs.domains != ''
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SJS_GH_TOKEN || secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           SJS_DOMAINS_NEW: ${{ steps.sign.outputs.domains }}
         run: |
@@ -90,5 +93,8 @@ jobs:
                   except urllib.error.HTTPError as e2:
                       print(f"::warning::创建 SJS_DOMAINS 失败 HTTP {e2.code}: {e2.read().decode()[:300]}")
               else:
-                  print(f"::warning::写回 SJS_DOMAINS 失败 HTTP {e.code}: {e.read().decode()[:300]}")
+                  msg = e.read().decode()[:200]
+                  print(f"::warning::写回 SJS_DOMAINS 失败 HTTP {e.code}: {msg}")
+                  if e.code == 403:
+                      print("::warning::请配置 Secret SJS_GH_TOKEN:fine-grained PAT 勾选 Actions(Read and write) 权限")
           EOF

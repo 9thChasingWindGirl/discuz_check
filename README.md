@@ -44,6 +44,7 @@
 | `SJS_USERNAME` | 论坛账号(主认证) |
 | `SJS_PASSWORD` | 论坛密码 |
 | `SJS_COOKIE` | 备用 Cookie(账号密码登录失败时兜底) |
+| `SJS_GH_TOKEN` | (可选)GitHub fine-grained PAT,权限勾选 **Actions (Read and write)**,用于将域名列表写回仓库 Variable |
 | `SJS_SMTP_HOST` | SMTP 服务器(默认 smtp.qq.com) |
 | `SJS_SMTP_PORT` | SMTP 端口(默认 465) |
 | `SJS_SMTP_SSL` | 是否 SSL(true/false) |
@@ -65,7 +66,15 @@
 
 - 种子域名只需配置一次,后续每次运行都会用最新探寻结果作为下一轮种子
 - 域名被探寻自动维护,**无需手动更新 Variable**(除非初始配置或全部域名失效)
-- 写回需要 `actions: write` 权限(工作流已声明);若写回失败仅告警,不影响签到结果
+- **公开仓库中 `GITHUB_TOKEN` 无法写 repository variables**,需配置 Secret `SJS_GH_TOKEN`(fine-grained PAT,勾选 **Actions (Read and write)**)写回才能生效;未配置则写回仅告警跳过,**不影响签到**
+- 变量不存在时工作流会自动创建;写回失败仅告警,不阻断签到结果
+
+### 认证方式说明
+
+签到报告会明确标注本次使用的认证方式:
+
+- **账号密码 (`用户名`)**:账号密码登录成功(优先)
+- **存量 Cookie**:账号密码未配置或登录失败,回退使用 Cookie
 
 ## 运行方式
 

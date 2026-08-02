@@ -1,6 +1,7 @@
 import sys
 import json
 import traceback
+from datetime import datetime
 from pathlib import Path
 from io import StringIO
 from contextlib import redirect_stdout
@@ -110,6 +111,7 @@ def cmd_sign():
     report_lines.append(f"时间: {now}")
 
     # ---------- 1. 认证:账号密码优先登录,失败回退存量 Cookie ----------
+    auth_source = "未认证"
     with redirect_stdout(StringIO()):
         account = cfg.get("account", {}) or {}
         cookie_str = cfg.get("cookie", "")
@@ -121,8 +123,12 @@ def cmd_sign():
                 if new_cookie:
                     cookie_str = new_cookie
                     cfg["cookie"] = new_cookie  # env 模式不落盘,仅内存
+                    auth_source = f"账号密码 ({account['username']})"
     if not cookie_str:
         return {"success": False, "error": "未配置账号密码或 Cookie", "domains": []}
+    if auth_source == "未认证":
+        auth_source = "存量 Cookie"
+    report_lines.append(f"认证方式: {auth_source}")
 
     with redirect_stdout(StringIO()):
         cookies = parse_cookie(cookie_str)
@@ -228,17 +234,22 @@ def cmd_sign():
 
     report_lines.append(f"完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    success = "✅" in sign_result or "⏭️" in sign_result
+    # ---------- 状态界定 ----------
+    # 已签到:本次运行完成了签到(存在断签时已一并补签,综合结果同为"已签到")
+    # 今日已签到:今日已被签到过(非本次操作,避免同日多次触发时输出不明确)
+    # 签到失败:签到操作未成功
     report_content = "\n".join(report_lines)
-
-    # 严格界定签到状态并缓存
     had_makeup = "补签成功" in report_content
     if "✅ 签到成功" in sign_result:
-        current_state = SIGN_STATE_MAKEUP if had_makeup else SIGN_STATE_SIGNED
-    elif "⏭️" in sign_result:
+        current_state = SIGN_STATE_SIGNED
+        final_result = "✅ 已签到" + ("（含补签）" if had_makeup else "")
+    elif "⏭️" in sign_result or "今日已签" in sign_result:
         current_state = SIGN_STATE_ALREADY
+        final_result = "⏭️ 今日已签到"
     else:
         current_state = SIGN_STATE_FAILED
+        final_result = f"❌ 签到失败：{sign_result}"
+    success = current_state in (SIGN_STATE_SIGNED, SIGN_STATE_ALREADY)
 
     # 先读取旧状态（含日期），再保存新状态
     last = load_last_sign_state()
@@ -247,19 +258,29 @@ def cmd_sign():
     with redirect_stdout(StringIO()):
         save_last_sign_state(current_state)
 
-    # 状态从非成功变为成功，或日期不同时（新的一天首次签到成功）才发邮件
+    # 仅本次运行完成签到(已签到)时发送邮件;今日已签到(重复触发)不重复发送
     today = datetime.now().strftime("%Y-%m-%d")
     should_notify = (
-        current_state in (SIGN_STATE_SIGNED, SIGN_STATE_MAKEUP)
+        current_state == SIGN_STATE_SIGNED
         and (prev_state in (SIGN_STATE_NONE, SIGN_STATE_FAILED) or prev_date != today)
     )
-    if should_notify and cfg.get("email", {}).get("sender"):
-        with redirect_stdout(StringIO()):
-            send_mail(cfg, f"每日签到 - {datetime.now().strftime('%m/%d')}", report_content)
+    mail_note = "邮件通知: 未满足发送条件（重复签到或非成功状态）"
+    if should_notify:
+        email_cfg = cfg.get("email", {}) or {}
+        if not (email_cfg.get("sender") and email_cfg.get("password") and email_cfg.get("receivers")):
+            mail_note = "邮件通知: 未配置 SMTP，已跳过"
+        else:
+            with redirect_stdout(StringIO()):
+                mail_ok = send_mail(cfg, f"每日签到 - {datetime.now().strftime('%m/%d')}", report_content)
+            mail_note = "邮件通知: 已发送" if mail_ok else "邮件通知: 发送失败（请检查 SMTP 配置/授权码/网络）"
+    report_lines.append(mail_note)
+    report_lines.append(f"结果: {final_result}")
+    report_content = "\n".join(report_lines)
 
     return {
         "success": success,
-        "result": sign_result,
+        "state": current_state,
+        "result": final_result,
         "report": report_content,
         "domains": domains,
     }
@@ -352,9 +373,6 @@ def cmd_login(username=None, password=None):
 
 
 if __name__ == "__main__":
-    # 需要从 sijishe_sign 导入 datetime
-    from datetime import datetime
-    
     if len(sys.argv) < 2:
         print(json.dumps({"success": False, "error": "缺少命令参数"}))
         sys.exit(1)
@@ -393,4 +411,4 @@ if __name__ == "__main__":
     except Exception as e:
         result = {"success": False, "error": str(e), "traceback": traceback.format_exc()}
     
-    print(json.dumps(result, ensure_ascii=False, default=str))
+    print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
