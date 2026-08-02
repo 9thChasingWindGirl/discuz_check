@@ -1,7 +1,6 @@
 import sys
 import json
 import traceback
-from datetime import datetime
 from pathlib import Path
 from io import StringIO
 from contextlib import redirect_stdout
@@ -28,9 +27,10 @@ from sijishe_sign import (
     discover_domains, discuz_login,
     load_last_sign_state, save_last_sign_state,
     load_sign_cache, save_sign_cache,
+    beijing_now,
     SIGN_STATE_NONE, SIGN_STATE_SIGNED, SIGN_STATE_MAKEUP,
     SIGN_STATE_ALREADY, SIGN_STATE_FAILED,
-    send_mail,
+    send_mail, sanitize_report_for_mail,
     SIGN_PAGE, SIGN_API, MAGIC_PAGE,
 )
 
@@ -107,7 +107,7 @@ def cmd_sign():
         cfg = load_config()
         cfg = ensure_config(cfg)
     report_lines = []
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
     report_lines.append(f"每日签到报告")
     report_lines.append(f"时间: {now}")
 
@@ -189,7 +189,6 @@ def cmd_sign():
     # 第一步：执行签到
     with redirect_stdout(StringIO()):
         sign_result = do_sign(domain, cookies, formhash)
-    report_lines.append(f"签到: {sign_result}")
 
     # 第二步：获取签到后的最新信息，判断是否断签
     with redirect_stdout(StringIO()):
@@ -244,7 +243,7 @@ def cmd_sign():
                 report_lines.append("未找到可补签的日期，跳过补签")
             report_lines.append("-" * 30)
 
-    report_lines.append(f"完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    report_lines.append(f"完成时间: {beijing_now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     # ---------- 状态界定 ----------
     # 已签到:本次运行完成了签到(存在断签时已一并补签,综合结果同为"已签到")
@@ -271,7 +270,7 @@ def cmd_sign():
         save_last_sign_state(current_state)
 
     # 仅本次运行完成签到(已签到)时发送邮件;今日已签到(重复触发)不重复发送
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = beijing_now().strftime("%Y-%m-%d")
     should_notify = (
         current_state == SIGN_STATE_SIGNED
         and (prev_state in (SIGN_STATE_NONE, SIGN_STATE_FAILED) or prev_date != today)
@@ -283,7 +282,11 @@ def cmd_sign():
             mail_note = "邮件通知: 未配置 SMTP，已跳过"
         else:
             with redirect_stdout(StringIO()):
-                mail_ok = send_mail(cfg, f"每日签到 - {datetime.now().strftime('%m/%d')}", report_content)
+                mail_ok = send_mail(
+                    cfg,
+                    f"每日签到 - {beijing_now().strftime('%m/%d')}",
+                    sanitize_report_for_mail(report_content),
+                )
             mail_note = "邮件通知: 已发送" if mail_ok else "邮件通知: 发送失败（请检查 SMTP 配置/授权码/网络）"
     report_lines.append(mail_note)
     report_lines.append(f"结果: {final_result}")
@@ -321,8 +324,8 @@ def cmd_send_cached_mail():
         f"缓存状态: {state} | {result}\n"
         f"{'=' * 30}\n"
     )
-    content = header + report
-    subject = f"每日签到(缓存) - {datetime.now().strftime('%m/%d')}"
+    content = header + sanitize_report_for_mail(report)
+    subject = f"每日签到(缓存) - {beijing_now().strftime('%m/%d')}"
 
     email_cfg = cfg.get("email", {}) or {}
     if not (email_cfg.get("sender") and email_cfg.get("password") and email_cfg.get("receivers")):

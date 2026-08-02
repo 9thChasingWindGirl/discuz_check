@@ -7,10 +7,18 @@ import time
 import smtplib
 import email.utils
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 
 import requests
+
+# 北京时间时区(UTC+8):GitHub Actions runner 默认 UTC,报告/日志统一使用北京时间
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def beijing_now():
+    """返回当前北京时间(UTC+8)"""
+    return datetime.now(BEIJING_TZ)
 
 # ============ 配置 ============
 
@@ -165,12 +173,11 @@ def load_last_sign_state():
 
 def save_last_sign_state(state: str):
     """写入本次签到状态缓存"""
-    from datetime import date
     cfg = load_config()
     cfg = ensure_config(cfg)
     cfg["last_sign"] = {
         "state": state,
-        "date": str(date.today()),
+        "date": str(beijing_now().date()),
     }
     save_config(cfg)
 
@@ -193,8 +200,7 @@ def save_sign_cache(state: str, result: str, report: str, domains=None):
       - 成功状态(signed/makeup/already)总是覆盖旧缓存
       - 失败状态不覆盖当日已有的成功缓存(避免失败结果冲掉当日成功记录)
     """
-    from datetime import date
-    today = str(date.today())
+    today = str(beijing_now().date())
     old = load_sign_cache()
     if state == SIGN_STATE_FAILED and old and old.get("date") == today \
             and old.get("state") in (SIGN_STATE_SIGNED, SIGN_STATE_MAKEUP, SIGN_STATE_ALREADY):
@@ -206,7 +212,7 @@ def save_sign_cache(state: str, result: str, report: str, domains=None):
         "result": result,
         "report": report,
         "domains": domains or [],
-        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "saved_at": beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     try:
         CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -253,7 +259,7 @@ DEFAULT_MAIL_CONFIG = {
 def log(msg, level="INFO", end="\n"):
     """统一日志输出：GitHub Actions 环境变量模式仅输出控制台；本地模式同时写文件"""
     icon = LOG_LEVEL_ICONS.get(level, "")
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] [{level}] {icon} {msg}"
 
     # 控制台输出
@@ -519,7 +525,7 @@ def verify_saved_email(cfg):
     log(f"正在测试邮件服务 ({sender} -> {', '.join(receivers)})...", "INFO")
     test_content = (
         f"每日签到 — 邮件服务测试\n"
-        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"时间: {beijing_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"SMTP: {mail_cfg.get('smtp_host', 'smtp.qq.com')}:{mail_cfg.get('smtp_port', 465)}\n"
         f"此邮件表示邮件服务配置正确，可正常接收签到通知。"
     )
@@ -532,6 +538,24 @@ def verify_saved_email(cfg):
 
 
 # ============ 邮件发送 ============
+
+
+def sanitize_report_for_mail(report):
+    """邮件内容脱敏:移除/打码账号、域名、formhash 等敏感信息"""
+    lines = []
+    for line in report.split("\n"):
+        stripped = line.strip()
+        # 整行删除:域名、formhash
+        if stripped.startswith(("域名:", "formhash:")):
+            continue
+        # 认证方式中的账号打码
+        if stripped.startswith("认证方式: 账号密码"):
+            line = "认证方式: 账号密码 (***)"
+        # 认证回退原因等行中的域名打码
+        elif stripped.startswith("认证回退原因:"):
+            line = re.sub(r"[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-z]{2,}", "***", line)
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def send_mail(cfg, subject, content):
@@ -1080,7 +1104,7 @@ def show_menu():
         print()
         print("=" * 55)
         print("  Discuz 论坛每日签到")
-        print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"  {beijing_now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("=" * 55)
         print()
         print("  请选择操作:")
@@ -1152,7 +1176,7 @@ def show_menu():
 
 
 def main():
-    log_separator(f"每日签到 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log_separator(f"每日签到 - {beijing_now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     # ---------- 加载配置 ----------
     cfg = load_config()
@@ -1257,7 +1281,7 @@ def main():
     # ---------- 收集报告 ----------
     report_lines = []
     report_lines.append(f"每日签到报告")
-    report_lines.append(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    report_lines.append(f"时间: {beijing_now().strftime('%Y-%m-%d %H:%M:%S')}")
     if username:
         report_lines.append(f"用户: {username}")
     report_lines.append(f"域名: {domain}")
@@ -1337,10 +1361,9 @@ def main():
     log("正在执行签到...", "INFO")
     sign_result = do_sign(domain, cookies, formhash)
     log(sign_result, "OK" if "✅" in sign_result else "INFO")
-    report_lines.append(f"签到: {sign_result}")
 
     report_lines.append("-" * 30)
-    report_lines.append(f"完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    report_lines.append(f"完成时间: {beijing_now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     # ---------- 状态界定 ----------
     # 已签到:本次运行完成了签到(存在断签时已一并补签,综合结果同为"已签到")
@@ -1371,7 +1394,11 @@ def main():
             log("邮件通知: 未配置 SMTP，已跳过", "WARN")
         else:
             log("正在发送邮件通知...", "INFO")
-            mail_ok = send_mail(cfg, f"每日签到 - {datetime.now().strftime('%m/%d')}", report_content)
+            mail_ok = send_mail(
+                cfg,
+                f"每日签到 - {beijing_now().strftime('%m/%d')}",
+                sanitize_report_for_mail(report_content),
+            )
             log("邮件通知: 已发送" if mail_ok else "邮件通知: 发送失败（请检查 SMTP 配置/授权码/网络）",
                 "OK" if mail_ok else "ERROR")
 
