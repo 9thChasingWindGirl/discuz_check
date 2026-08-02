@@ -1,9 +1,13 @@
 # 运行时生成，包含敏感凭证（cookie / SMTP 授权码 / 账号密码）
 sijishe_config.json
 
+# 签到结果缓存(当日最近一次,供调试邮件使用)
+sijishe_cache.json
+
 # 日志
 *.log
 
 # Python
 __pycache__/
 *.pyc
+.atomcode/memory.md

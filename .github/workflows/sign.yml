@@ -5,6 +5,15 @@ on:
     # UTC 16:00 = 北京时间每日 00:00
     - cron: '0 16 * * *'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: '运行模式: sign=执行签到并发送邮件(默认); send_mail=仅用当日缓存签到结果发送邮件(调试,不执行签到)'
+        required: false
+        default: sign
+        type: choice
+        options:
+          - sign
+          - send_mail
 
 permissions:
   contents: read
@@ -44,10 +53,18 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
-      # 单次调用完成全链路:账号密码登录(失败回退 Cookie)→ 域名自动探寻 → 签到/补签 → 邮件
-      # 原始 JSON 保存到 /tmp/sign_result.json 供写回步骤使用;
-      # 日志输出可读化报告(状态行 + 多行 report),避免 \n 转义串
+      # 恢复当日签到结果缓存(供 send_mail 调试模式使用)
+      - name: 恢复签到结果缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: sijishe_cache.json
+          key: sign-cache-${{ github.run_id }}
+          restore-keys: |
+            sign-cache-
+
+      # ===== 模式:sign(默认)= 执行签到 =====
       - name: 执行签到
+        if: inputs.mode == '' || inputs.mode == 'sign'
         id: sign
         run: |
           python sijishe_api.py sign > /tmp/sign_result.json
@@ -112,3 +129,16 @@ jobs:
                       else:
                           print("::warning::请检查 Secret SJS_GH_TOKEN 的 Actions(Read and write) 权限")
           EOF
+
+      # ===== 模式:send_mail(调试)= 仅用当日缓存结果发送邮件,不执行签到 =====
+      - name: 发送缓存签到结果邮件(调试)
+        if: inputs.mode == 'send_mail'
+        run: python sijishe_api.py send_cached_mail
+
+      # 保存签到结果缓存(供下次 send_mail 调试使用)
+      - name: 保存签到结果缓存
+        if: always() && inputs.mode != 'send_mail'
+        uses: actions/cache/save@v4
+        with:
+          path: sijishe_cache.json
+          key: sign-cache-${{ github.run_id }}

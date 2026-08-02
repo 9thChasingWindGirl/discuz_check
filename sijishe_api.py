@@ -27,6 +27,7 @@ from sijishe_sign import (
     load_domains_from_config, save_domains_to_config,
     discover_domains, discuz_login,
     load_last_sign_state, save_last_sign_state,
+    load_sign_cache, save_sign_cache,
     SIGN_STATE_NONE, SIGN_STATE_SIGNED, SIGN_STATE_MAKEUP,
     SIGN_STATE_ALREADY, SIGN_STATE_FAILED,
     send_mail,
@@ -112,23 +113,34 @@ def cmd_sign():
 
     # ---------- 1. 认证:账号密码优先登录,失败回退存量 Cookie ----------
     auth_source = "未认证"
+    auth_fallback_reason = ""
     with redirect_stdout(StringIO()):
         account = cfg.get("account", {}) or {}
         cookie_str = cfg.get("cookie", "")
         if account.get("username") and account.get("password"):
             login_domains = cfg.get("domains") or load_domains_from_config()
-            login_domain = login_domains[0] if login_domains else None
-            if login_domain:
-                new_cookie = discuz_login(login_domain, account["username"], account["password"])
+            # 依次尝试多个域名登录:首个被 Cloudflare 拦截/失败时继续尝试下一个
+            login_errors = []
+            for login_domain in login_domains:
+                new_cookie, login_err = discuz_login(login_domain, account["username"], account["password"])
                 if new_cookie:
                     cookie_str = new_cookie
                     cfg["cookie"] = new_cookie  # env 模式不落盘,仅内存
                     auth_source = f"账号密码 ({account['username']})"
+                    break
+                login_errors.append(f"{login_domain}: {login_err}")
+            if auth_source == "未认证":
+                if login_errors:
+                    auth_fallback_reason = "账号密码登录失败: " + " | ".join(login_errors)
+                else:
+                    auth_fallback_reason = "账号密码登录失败: 无可用域名"
     if not cookie_str:
         return {"success": False, "error": "未配置账号密码或 Cookie", "domains": []}
     if auth_source == "未认证":
         auth_source = "存量 Cookie"
     report_lines.append(f"认证方式: {auth_source}")
+    if auth_fallback_reason:
+        report_lines.append(f"认证回退原因: {auth_fallback_reason}")
 
     with redirect_stdout(StringIO()):
         cookies = parse_cookie(cookie_str)
@@ -277,12 +289,53 @@ def cmd_sign():
     report_lines.append(f"结果: {final_result}")
     report_content = "\n".join(report_lines)
 
+    # 当日签到结果写入缓存(成功覆盖失败,失败不覆盖当日成功记录)
+    with redirect_stdout(StringIO()):
+        save_sign_cache(current_state, final_result, report_content, domains)
+
     return {
         "success": success,
         "state": current_state,
         "result": final_result,
         "report": report_content,
         "domains": domains,
+    }
+
+
+def cmd_send_cached_mail():
+    """(调试)读取当日缓存签到结果并通过邮件发送,邮件内容注明来源为缓存"""
+    with redirect_stdout(StringIO()):
+        cfg = load_config()
+        cfg = ensure_config(cfg)
+        cache = load_sign_cache()
+    if not cache:
+        return {"success": False, "error": "无缓存签到结果,请先运行 sign"}
+
+    report = cache.get("report", "")
+    result = cache.get("result", "")
+    state = cache.get("state", "")
+    date_str = cache.get("date", "")
+    header = (
+        f"【调试】邮件内容来自签到结果缓存(非本次实时签到)\n"
+        f"缓存日期: {date_str}\n"
+        f"缓存状态: {state} | {result}\n"
+        f"{'=' * 30}\n"
+    )
+    content = header + report
+    subject = f"每日签到(缓存) - {datetime.now().strftime('%m/%d')}"
+
+    email_cfg = cfg.get("email", {}) or {}
+    if not (email_cfg.get("sender") and email_cfg.get("password") and email_cfg.get("receivers")):
+        return {"success": False, "error": "邮件通知: 未配置 SMTP，已跳过", "cache": cache}
+    with redirect_stdout(StringIO()):
+        mail_ok = send_mail(cfg, subject, content)
+    if not mail_ok:
+        return {"success": False, "error": "邮件发送失败(请检查 SMTP 配置/授权码/网络)", "cache": cache}
+    return {
+        "success": True,
+        "message": f"已发送缓存签到结果邮件 (缓存日期 {date_str})",
+        "cache_state": state,
+        "cache_result": result,
     }
 
 
@@ -360,9 +413,9 @@ def cmd_login(username=None, password=None):
         return {"success": False, "error": "所有域名均不可达"}
 
     with redirect_stdout(StringIO()):
-        cookie_str = discuz_login(domain, username, password)
+        cookie_str, login_err = discuz_login(domain, username, password)
     if not cookie_str:
-        return {"success": False, "error": f"登录失败 ({domain})"}
+        return {"success": False, "error": f"登录失败 ({domain}): {login_err}"}
 
     with redirect_stdout(StringIO()):
         cfg = load_config()
@@ -389,6 +442,8 @@ if __name__ == "__main__":
             result = cmd_info()
         elif command == "sign":
             result = cmd_sign()
+        elif command == "send_cached_mail":
+            result = cmd_send_cached_mail()
         elif command == "update_email":
             email_json = sys.argv[2] if len(sys.argv) > 2 else "{}"
             result = cmd_update_email(json.loads(email_json))

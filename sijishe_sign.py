@@ -18,6 +18,8 @@ import requests
 CONFIG_DIR = Path(__file__).parent
 CONFIG_FILE = CONFIG_DIR / "sijishe_config.json"
 LOG_FILE = CONFIG_DIR / "sijishe_sign.log"
+# 签到结果缓存(当日最近一次结果,供手动调试邮件使用;env 模式下亦落盘以便 workflow 缓存)
+CACHE_FILE = CONFIG_DIR / "sijishe_cache.json"
 
 # 日志级别
 LOG_LEVELS = {"DEBUG": 0, "INFO": 1, "OK": 2, "WARN": 3, "ERROR": 4}
@@ -171,6 +173,47 @@ def save_last_sign_state(state: str):
         "date": str(date.today()),
     }
     save_config(cfg)
+
+
+def load_sign_cache():
+    """读取当日签到结果缓存(JSON),不存在或损坏返回 None"""
+    if not CACHE_FILE.exists():
+        return None
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def save_sign_cache(state: str, result: str, report: str, domains=None):
+    """
+    保存当日签到结果缓存(env 模式下同样落盘,供 workflow 缓存/调试邮件使用)
+    覆盖规则:
+      - 成功状态(signed/makeup/already)总是覆盖旧缓存
+      - 失败状态不覆盖当日已有的成功缓存(避免失败结果冲掉当日成功记录)
+    """
+    from datetime import date
+    today = str(date.today())
+    old = load_sign_cache()
+    if state == SIGN_STATE_FAILED and old and old.get("date") == today \
+            and old.get("state") in (SIGN_STATE_SIGNED, SIGN_STATE_MAKEUP, SIGN_STATE_ALREADY):
+        log("签到失败，保留当日已成功的缓存结果", "WARN")
+        return
+    cache = {
+        "date": today,
+        "state": state,
+        "result": result,
+        "report": report,
+        "domains": domains or [],
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
 
 
 def get_preferred_domain():
@@ -592,41 +635,81 @@ def verify_cookie(domain, cookies):
 
 def discuz_login(domain, username, password):
     """
-    使用账号密码登录论坛 (Discuz!)，返回登录后的 Cookie 字符串
-    失败返回 None
+    使用账号密码登录论坛 (Discuz!)
+    返回 (cookie字符串, 失败原因):
+      成功 → (cookie_str, None)
+      失败 → (None, 具体原因字符串)
     """
     import hashlib
+    import html as _html
 
-    login_page = f"https://{domain}/member.php?mod=logging&action=login"
+    # Cloudflare 挑战特征(登录页被 CF JS 挑战拦截时页面含这些标记)
+    CF_MARKERS = ("__cf_chl", "challenge-platform", "cf_chl_opt", "__cfRLUnblockHandlers")
+
     session = requests.Session()
     session.headers.update(get_common_headers())
-    try:
-        resp = session.get(login_page, timeout=15)
-    except requests.RequestException as e:
-        log(f"登录页请求失败: {e}", "ERROR")
-        return None
-    if resp.status_code != 200:
-        log(f"登录页 HTTP {resp.status_code}", "WARN")
-        return None
+
+    # 该模板的登录表单由 JS 弹窗动态加载(showWindow('login', href)),
+    # 普通 GET 登录页只有触发按钮、无完整表单。优先请求弹窗路径:
+    #   member.php?mod=logging&action=login&infloat=yes&handlekey=login&inajax=1&ajaxtarget=fwin_login
+    login_urls = [
+        f"https://{domain}/member.php?mod=logging&action=login"
+        f"&infloat=yes&handlekey=login&inajax=1&ajaxtarget=fwin_login",
+        f"https://{domain}/member.php?mod=logging&action=login",
+    ]
+    form_html = None
+    used_url = None
+    for url in login_urls:
+        try:
+            resp = session.get(url, timeout=15)
+        except requests.RequestException as e:
+            log(f"登录页请求失败 ({url}): {e}", "ERROR")
+            continue
+        if resp.status_code != 200:
+            if resp.status_code == 403 and any(m in resp.text for m in CF_MARKERS):
+                reason = f"登录页被 Cloudflare 挑战拦截 (HTTP 403, {domain})，无法自动登录，需改用 Cookie"
+                log(reason, "WARN")
+                return None, reason
+            log(f"登录页 HTTP {resp.status_code} ({url})", "WARN")
+            continue
+        if 'name="username"' in resp.text:
+            form_html = resp.text
+            used_url = url
+            break
+    if not form_html:
+        reason = f"登录页均无法获取登录表单 ({domain})"
+        log(reason, "ERROR")
+        return None, reason
 
     # 提取 formhash
-    m = re.search(r'name="formhash"\s+value="([a-zA-Z0-9]+)"', resp.text)
+    m = re.search(r'name="formhash"\s+value="([a-zA-Z0-9]+)"', form_html)
     if not m:
-        log("登录页未找到 formhash，登录失败", "ERROR")
-        return None
+        if any(mk in form_html for mk in CF_MARKERS):
+            reason = f"登录页被 Cloudflare 挑战拦截 ({domain})，未获取到 formhash，需改用 Cookie"
+            log(reason, "ERROR")
+            return None, reason
+        reason = f"登录页未找到 formhash ({domain})"
+        log(reason, "ERROR")
+        return None, reason
     formhash = m.group(1)
 
-    # 提取 loginhash（表单 action 中）
-    m = re.search(
-        r'action="member\.php\?mod=logging&action=login&loginsubmit=yes&loginhash=([a-zA-Z0-9]+)"',
-        resp.text,
-    )
-    loginhash = m.group(1) if m else ""
+    # 从登录表单 action 提取完整查询串(含 loginhash / handlekey,顺序不定,HTML 实体需反转义)
+    m = re.search(r'name="login"[^>]*action="([^"]+)"', form_html, re.IGNORECASE)
+    action_query = _html.unescape(m.group(1)) if m else ""
+    loginhash_m = re.search(r'loginhash=([a-zA-Z0-9]+)', action_query)
+    loginhash = loginhash_m.group(1) if loginhash_m else ""
+    handlekey_m = re.search(r'handlekey=([a-zA-Z0-9]+)', action_query)
+    handlekey = handlekey_m.group(1) if handlekey_m else "login"
 
-    post_url = (
-        f"https://{domain}/member.php?mod=logging&action=login"
-        f"&loginsubmit=yes" + (f"&loginhash={loginhash}" if loginhash else "")
-    )
+    # POST URL:优先使用表单 action 提取的完整路径(含 handlekey 等参数)
+    if action_query.startswith("member.php"):
+        post_url = f"https://{domain}/{action_query}"
+    else:
+        post_url = (
+            f"https://{domain}/member.php?mod=logging&action=login&loginsubmit=yes"
+            f"&handlekey={handlekey}"
+            + (f"&loginhash={loginhash}" if loginhash else "")
+        )
     data = {
         "formhash": formhash,
         "referer": f"https://{domain}/",
@@ -642,28 +725,31 @@ def discuz_login(domain, username, password):
             post_url, data=data, timeout=15,
             headers={
                 **get_common_headers(),
-                "Referer": login_page,
+                "Referer": used_url,
                 "X-Requested-With": "XMLHttpRequest",
                 "Content-Type": "application/x-www-form-urlencoded",
             },
         )
     except requests.RequestException as e:
-        log(f"登录请求失败: {e}", "ERROR")
-        return None
+        reason = f"登录请求失败: {e}"
+        log(reason, "ERROR")
+        return None, reason
 
     # 登录成功与否：检查 session 中是否出现 auth cookie
     cookies = session.cookies
     auth_cookie = [c for c in cookies if "auth" in c.name.lower()]
     if not auth_cookie:
         if "验证码" in resp.text:
-            log("登录需要验证码，暂不支持自动登录", "ERROR")
+            reason = "登录需要验证码，暂不支持自动登录"
+            log(reason, "ERROR")
         else:
-            log(f"登录失败 (HTTP {resp.status_code})，未获取到 auth cookie", "ERROR")
-        return None
+            reason = f"登录失败 (HTTP {resp.status_code})，未获取到 auth cookie"
+            log(reason, "ERROR")
+        return None, reason
 
     cookie_str = "; ".join(f"{c.name}={c.value}" for c in cookies)
     log(f"账号密码登录成功 (用户: {username})", "OK")
-    return cookie_str
+    return cookie_str, None
 
 
 # ============ 域名管理 ============
@@ -1084,13 +1170,16 @@ def main():
         if not login_domain:
             domains = load_domains_from_config()
             login_domain = domains[0] if domains else None
-        new_cookie = discuz_login(login_domain, username, password) if login_domain else None
+        if login_domain:
+            new_cookie, login_err = discuz_login(login_domain, username, password)
+        else:
+            new_cookie, login_err = None, "无可用域名"
         if new_cookie:
             cookie_str = new_cookie
             cfg["cookie"] = new_cookie
             save_config(cfg)
         else:
-            log("账号密码登录失败，回退使用已保存的 Cookie", "WARN")
+            log(f"账号密码登录失败({login_err})，回退使用已保存的 Cookie", "WARN")
 
     if not cookie_str:
         log("首次运行，请先配置 Cookie 或账号密码", "INFO")
