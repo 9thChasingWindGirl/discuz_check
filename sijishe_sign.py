@@ -38,6 +38,14 @@ SIGN_PAGE = "/k_misign-sign.html"
 SIGN_API = "/plugin.php"
 MAGIC_PAGE = "/home.php"
 
+# Cloudflare 挑战特征(页面被 CF JS 挑战拦截时含这些标记)
+CF_MARKERS = ("__cf_chl", "challenge-platform", "cf_chl_opt", "__cfRLUnblockHandlers")
+
+# 最终状态:以"签到成功 + 连续签到达成"为唯一成功标准
+SIGN_FINAL_SUCCESS = "success"      # 签到成功且连续签到正常(含 Cookie 兜底签到成功)
+SIGN_FINAL_BREAK = "break"          # 已签到但断签未补(连续签到受损)
+SIGN_FINAL_FAILED = "failed"        # 签到动作失败
+
 # ============ 域名管理（基于配置文件）============
 
 # 优选域名有效期（秒）：7 天
@@ -197,13 +205,13 @@ def save_sign_cache(state: str, result: str, report: str, domains=None):
     """
     保存当日签到结果缓存(env 模式下同样落盘,供 workflow 缓存/调试邮件使用)
     覆盖规则:
-      - 成功状态(signed/makeup/already)总是覆盖旧缓存
-      - 失败状态不覆盖当日已有的成功缓存(避免失败结果冲掉当日成功记录)
+      - 成功状态(success)总是覆盖旧缓存
+      - 失败状态(break/failed)不覆盖当日已有的成功缓存(避免失败结果冲掉当日成功记录)
     """
     today = str(beijing_now().date())
     old = load_sign_cache()
-    if state == SIGN_STATE_FAILED and old and old.get("date") == today \
-            and old.get("state") in (SIGN_STATE_SIGNED, SIGN_STATE_MAKEUP, SIGN_STATE_ALREADY):
+    if state in (SIGN_FINAL_BREAK, SIGN_FINAL_FAILED) and old and old.get("date") == today \
+            and old.get("state") == SIGN_FINAL_SUCCESS:
         log("签到失败，保留当日已成功的缓存结果", "WARN")
         return
     cache = {
@@ -667,9 +675,6 @@ def discuz_login(domain, username, password):
     import hashlib
     import html as _html
 
-    # Cloudflare 挑战特征(登录页被 CF JS 挑战拦截时页面含这些标记)
-    CF_MARKERS = ("__cf_chl", "challenge-platform", "cf_chl_opt", "__cfRLUnblockHandlers")
-
     session = requests.Session()
     session.headers.update(get_common_headers())
 
@@ -684,10 +689,17 @@ def discuz_login(domain, username, password):
     form_html = None
     used_url = None
     for url in login_urls:
-        try:
-            resp = session.get(url, timeout=15)
-        except requests.RequestException as e:
-            log(f"登录页请求失败 ({url}): {e}", "ERROR")
+        # 网络类失败重试一次(2s 间隔),超时/抖动多发生在此环节
+        resp = None
+        for attempt in range(2):
+            try:
+                resp = session.get(url, timeout=15)
+                break
+            except requests.RequestException as e:
+                log(f"登录页请求失败 ({url}) 第{attempt + 1}次: {e}", "ERROR")
+                if attempt == 0:
+                    time.sleep(2)
+        if resp is None:
             continue
         if resp.status_code != 200:
             if resp.status_code == 403 and any(m in resp.text for m in CF_MARKERS):
@@ -744,26 +756,36 @@ def discuz_login(domain, username, password):
         "answer": "",
         "cookietime": "2592000",
     }
-    try:
-        resp = session.post(
-            post_url, data=data, timeout=15,
-            headers={
-                **get_common_headers(),
-                "Referer": used_url,
-                "X-Requested-With": "XMLHttpRequest",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-        )
-    except requests.RequestException as e:
-        reason = f"登录请求失败: {e}"
-        log(reason, "ERROR")
-        return None, reason
+    resp = None
+    last_err = ""
+    for attempt in range(2):
+        try:
+            resp = session.post(
+                post_url, data=data, timeout=15,
+                headers={
+                    **get_common_headers(),
+                    "Referer": used_url,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            )
+            break
+        except requests.RequestException as e:
+            last_err = str(e)
+            log(f"登录请求失败 ({domain}) 第{attempt + 1}次: {e}", "ERROR")
+            if attempt == 0:
+                time.sleep(2)
+    if resp is None:
+        return None, f"登录请求失败: {last_err}"
 
     # 登录成功与否：检查 session 中是否出现 auth cookie
     cookies = session.cookies
     auth_cookie = [c for c in cookies if "auth" in c.name.lower()]
     if not auth_cookie:
-        if "验证码" in resp.text:
+        if resp.status_code == 403 and any(m in resp.text for m in CF_MARKERS):
+            reason = f"登录被 Cloudflare 挑战拦截 (HTTP 403, {domain})，需改用 Cookie"
+            log(reason, "WARN")
+        elif "验证码" in resp.text:
             reason = "登录需要验证码，暂不支持自动登录"
             log(reason, "ERROR")
         else:
@@ -936,6 +958,12 @@ def do_sign(domain, cookies, formhash):
     except requests.RequestException as e:
         return f"签到请求失败: {e}"
 
+    if resp.status_code != 200:
+        if resp.status_code == 403:
+            detail = "（疑似 Cloudflare 拦截）" if any(m in resp.text for m in CF_MARKERS) else ""
+            return f"❌ 签到请求被拦截 (HTTP 403){detail}"
+        return f"签到请求失败: HTTP {resp.status_code}"
+
     text = resp.text
 
     if "签到成功" in text:
@@ -954,6 +982,162 @@ def do_sign(domain, cookies, formhash):
                 return "✅ 签到成功"
             return f"签到结果: {content}"
         return f"未知响应: {text[:200]}"
+
+
+# ============ 失败分类与最终状态 ============
+
+def classify_sign_result(result: str) -> str:
+    """
+    对签到结果字符串分类,决定失败后的可重试性:
+      success  : 签到成功
+      already  : 今日已签(非本次操作)
+      retryable: 网络/服务器瞬时失败,值得短时退避重试
+      auth     : Cookie 失效,需重新登录后再试
+      blocked  : 风控拦截(CF/403),当日大概率无解,重试无意义
+      permanent: 参数或资源问题(非法字符/积分不足等),重试无意义
+    """
+    if "签到成功" in result:
+        return "success"
+    if "⏭️" in result or "今日已签" in result:
+        return "already"
+    if result.startswith("签到请求失败"):
+        return "retryable"
+    if "被拦截" in result or "Cloudflare" in result or "拦截" in result:
+        return "blocked"
+    if "Cookie 已过期" in result or "请先登录" in result:
+        return "auth"
+    if "非法字符" in result:
+        return "permanent"
+    if result.startswith("未知响应"):
+        # 未知响应多为 CDN/CF 抖动:含 CF 特征按风控处理,否则可重试
+        return "blocked" if "__cf" in result.lower() else "retryable"
+    return "permanent"
+
+
+def resolve_final_state(sign_result, need_makeup=False, makeup_ok=True):
+    """
+    最终状态判定:以"签到成功 + 连续签到达成"为唯一成功标准。
+    认证方式(账号密码/Cookie 兜底)不影响结果——Cookie 兜底签到成功即 success。
+    返回 (final_state, 结论文案, action_state)
+      final_state : SIGN_FINAL_SUCCESS / SIGN_FINAL_BREAK / SIGN_FINAL_FAILED
+      action_state: SIGN_STATE_SIGNED / SIGN_STATE_ALREADY / SIGN_STATE_FAILED
+    """
+    if "✅ 签到成功" in sign_result:
+        action_state = SIGN_STATE_SIGNED
+    elif "⏭️" in sign_result or "今日已签" in sign_result:
+        action_state = SIGN_STATE_ALREADY
+    else:
+        action_state = SIGN_STATE_FAILED
+
+    if action_state == SIGN_STATE_FAILED:
+        detail = sign_result
+        if detail.startswith("❌ "):  # do_sign 的部分错误信息自带 ❌ 前缀,避免拼接出双重前缀
+            detail = detail[2:]
+        return SIGN_FINAL_FAILED, f"❌ 签到失败：{detail}", action_state
+    if need_makeup and not makeup_ok:
+        return SIGN_FINAL_BREAK, "❌ 断签未补：连续签到受损，请手动补签", action_state
+    if action_state == SIGN_STATE_ALREADY:
+        text = "✅ 已签到（含补签，连续签到正常）" if need_makeup else "✅ 今日已签到"
+        return SIGN_FINAL_SUCCESS, text, action_state
+    return SIGN_FINAL_SUCCESS, "✅ 签到成功" + ("（含补签）" if need_makeup else ""), action_state
+
+
+def summarize_login_failures(errors):
+    """
+    把各域名登录失败原因压缩为人类可读摘要(域名留待邮件脱敏层打码),
+    避免把 HTTPSConnectionPool 等原始异常文本直接展示给用户。
+    errors: [(domain, err_str), ...]
+    """
+    parts = []
+    for domain, err in errors:
+        if "timed out" in err or "超时" in err:
+            label = "超时"
+        elif "Cloudflare" in err or "403" in err:
+            label = "被拦截(403)"
+        elif "验证码" in err:
+            label = "需要验证码"
+        else:
+            label = "失败"
+        parts.append(f"{domain} {label}")
+    return "、".join(parts)
+
+
+def login_with_account(cfg, domains):
+    """
+    用账号密码依次尝试各域名登录(内部已含网络重试)。
+    返回 (cookie_str or None, [(domain, err), ...])
+    """
+    account = cfg.get("account", {}) or {}
+    username, password = account.get("username", ""), account.get("password", "")
+    if not (username and password):
+        return None, []
+    errors = []
+    for d in domains:
+        cookie_str, err = discuz_login(d, username, password)
+        if cookie_str:
+            return cookie_str, errors
+        errors.append((d, err))
+    return None, errors
+
+
+def retry_sign(cfg, domains, cookies, domain=None):
+    """
+    签到多级重试(基于失败分类):
+      retryable : 退避重试最多 3 次(2s/5s/8s), 期间刷新 formhash
+      auth      : 有账号密码则重新登录刷新 Cookie 后重签一次
+      blocked/permanent: 换其他可取 formhash 的域名重签一次
+    返回 (sign_result, used_domain, used_cookies)
+    """
+    def _fresh_formhash(d):
+        return get_formhash(d, cookies)
+
+    if not domain:
+        for d in domains:
+            if _fresh_formhash(d):
+                domain = d
+                break
+    if not domain:
+        return "❌ 无法获取 formhash", None, cookies
+
+    formhash = _fresh_formhash(domain)
+    if not formhash:
+        return "❌ 无法获取 formhash", domain, cookies
+
+    result = ""
+    switched_domain = False
+    for attempt in range(3):
+        if not formhash:
+            formhash = _fresh_formhash(domain)
+        if not formhash:
+            return "❌ 无法获取 formhash", domain, cookies
+        result = do_sign(domain, cookies, formhash)
+        cat = classify_sign_result(result)
+        if cat in ("success", "already"):
+            return result, domain, cookies
+        if cat == "retryable":
+            log(f"签到网络失败,第 {attempt + 1} 次退避重试: {result}", "WARN")
+            time.sleep(2 + 3 * attempt)  # 2s/5s/8s
+            formhash = None  # 重试前刷新
+            continue
+        if cat == "auth":
+            log("Cookie 失效,尝试账号密码重新登录后重签", "WARN")
+            new_cookie, _ = login_with_account(cfg, domains)
+            if new_cookie:
+                cookies = parse_cookie(new_cookie)
+                formhash = None
+                continue
+            return result, domain, cookies
+        # blocked / permanent:换域名重签一次,仍失败即放弃(重试无意义)
+        if not switched_domain:
+            alt = next((d for d in domains if d != domain), None)
+            if alt:
+                log(f"当前域名签到受阻({cat}),切换域名 {alt} 重试", "WARN")
+                domain = alt
+                formhash = None
+                switched_domain = True
+                continue
+        return result, domain, cookies
+    return result, domain, cookies
 
 
 def do_makeup_sign(domain, cookies, formhash, bid):
@@ -1357,6 +1541,13 @@ def main():
     else:
         log(makeup_reason, "INFO")
 
+    # 断签是否已补完(供最终状态判定:成功 = 签到成功 + 连续签到达成)
+    makeup_ok = True
+    if need_makeup:
+        lx_after = int(sign_info.get("lxdays", 0)) if sign_info else 0
+        lxt_after = int(sign_info.get("lxtdays", 0)) if sign_info else 0
+        makeup_ok = lx_after > 1 or lxt_after <= 1
+
     # ---------- 执行签到 ----------
     log("正在执行签到...", "INFO")
     sign_result = do_sign(domain, cookies, formhash)
@@ -1366,19 +1557,13 @@ def main():
     report_lines.append(f"完成时间: {beijing_now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     # ---------- 状态界定 ----------
-    # 已签到:本次运行完成了签到(存在断签时已一并补签,综合结果同为"已签到")
-    # 今日已签到:今日已被签到过(非本次操作,避免同日多次触发时输出不明确)
-    # 签到失败:签到操作未成功
-    if "✅ 签到成功" in sign_result:
-        current_state = SIGN_STATE_SIGNED
-        final_result = "✅ 已签到" + ("（含补签）" if makeup_total > 0 else "")
-    elif "⏭️" in sign_result or "今日已签" in sign_result:
-        current_state = SIGN_STATE_ALREADY
-        final_result = "⏭️ 今日已签到"
-    else:
-        current_state = SIGN_STATE_FAILED
-        final_result = f"❌ 签到失败：{sign_result}"
+    # 成功 = 签到成功(含 Cookie 兜底)且连续签到达成(无断签或断签已补)
+    # 认证方式不影响结果:账号密码登录失败、Cookie 兜底签到成功同样是"签到成功"
+    final_state, conclusion, _action_state = resolve_final_state(sign_result, need_makeup, makeup_ok)
+    final_result = conclusion
 
+    # 结论先行:插入报告标题之后,让邮件/控制台第一眼看到是否成功
+    report_lines.insert(1, conclusion + "\n")
     report_lines.append(f"结果: {final_result}")
     report_content = "\n".join(report_lines)
     print()  # 空行
@@ -1387,10 +1572,11 @@ def main():
     print()
 
     # ---------- 邮件通知 ----------
-    # 仅本次运行完成签到(已签到)时发送;今日已签到(重复触发)不重复发送
-    if current_state == SIGN_STATE_SIGNED:
-        email_cfg = cfg.get("email", {}) or {}
-        if not (email_cfg.get("sender") and email_cfg.get("password") and email_cfg.get("receivers")):
+    # 成功(success):发送签到成功报告;失败(break/failed):发送失败告警
+    email_cfg = cfg.get("email", {}) or {}
+    mail_configured = bool(email_cfg.get("sender") and email_cfg.get("password") and email_cfg.get("receivers"))
+    if final_state == SIGN_FINAL_SUCCESS:
+        if not mail_configured:
             log("邮件通知: 未配置 SMTP，已跳过", "WARN")
         else:
             log("正在发送邮件通知...", "INFO")
@@ -1401,8 +1587,20 @@ def main():
             )
             log("邮件通知: 已发送" if mail_ok else "邮件通知: 发送失败（请检查 SMTP 配置/授权码/网络）",
                 "OK" if mail_ok else "ERROR")
+    else:
+        if not mail_configured:
+            log("邮件通知: 未配置 SMTP，已跳过（签到失败，请及时处理）", "WARN")
+        else:
+            log("正在发送失败告警邮件...", "WARN")
+            mail_ok = send_mail(
+                cfg,
+                f"签到失败告警 - {beijing_now().strftime('%m/%d')}",
+                sanitize_report_for_mail(report_content),
+            )
+            log("告警邮件: 已发送" if mail_ok else "告警邮件: 发送失败（请检查 SMTP 配置/授权码/网络）",
+                "OK" if mail_ok else "ERROR")
 
-    log(f"签到完成 - {final_result}", "OK" if current_state != SIGN_STATE_FAILED else "ERROR")
+    log(f"签到完成 - {final_result}", "OK" if final_state == SIGN_FINAL_SUCCESS else "ERROR")
 
 
 if __name__ == "__main__":

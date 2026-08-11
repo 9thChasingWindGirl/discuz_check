@@ -18,18 +18,20 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from sijishe_sign import (
     load_config, save_config, ensure_config,
     parse_cookie, get_common_headers,
-    get_formhash, get_sign_info, do_sign,
+    get_formhash, get_sign_info,
     do_makeup_sign, check_makeup_needed,
     find_bid_list, try_domains_for_formhash,
     verify_cookie, pick_fastest_domain,
     set_preferred_domain, get_preferred_domain,
     load_domains_from_config, save_domains_to_config,
     discover_domains, discuz_login,
+    login_with_account, summarize_login_failures, retry_sign,
+    resolve_final_state,
     load_last_sign_state, save_last_sign_state,
     load_sign_cache, save_sign_cache,
     beijing_now,
-    SIGN_STATE_NONE, SIGN_STATE_SIGNED, SIGN_STATE_MAKEUP,
-    SIGN_STATE_ALREADY, SIGN_STATE_FAILED,
+    SIGN_STATE_SIGNED, SIGN_STATE_ALREADY,
+    SIGN_FINAL_SUCCESS,
     send_mail, sanitize_report_for_mail,
     SIGN_PAGE, SIGN_API, MAGIC_PAGE,
 )
@@ -119,21 +121,17 @@ def cmd_sign():
         cookie_str = cfg.get("cookie", "")
         if account.get("username") and account.get("password"):
             login_domains = cfg.get("domains") or load_domains_from_config()
-            # 依次尝试多个域名登录:首个被 Cloudflare 拦截/失败时继续尝试下一个
-            login_errors = []
-            for login_domain in login_domains:
-                new_cookie, login_err = discuz_login(login_domain, account["username"], account["password"])
-                if new_cookie:
-                    cookie_str = new_cookie
-                    cfg["cookie"] = new_cookie  # env 模式不落盘,仅内存
-                    auth_source = f"账号密码 ({account['username']})"
-                    break
-                login_errors.append(f"{login_domain}: {login_err}")
-            if auth_source == "未认证":
-                if login_errors:
-                    auth_fallback_reason = "账号密码登录失败: " + " | ".join(login_errors)
-                else:
-                    auth_fallback_reason = "账号密码登录失败: 无可用域名"
+            # 依次尝试多个域名登录(内部含网络重试):首个被 Cloudflare 拦截/失败时继续尝试下一个
+            new_cookie, login_errors = login_with_account(cfg, login_domains)
+            if new_cookie:
+                cookie_str = new_cookie
+                cfg["cookie"] = new_cookie  # env 模式不落盘,仅内存
+                auth_source = f"账号密码 ({account['username']})"
+            elif login_errors:
+                # 摘要化:只保留"域名+失败类型",原始异常文本仅留在控制台日志
+                auth_fallback_reason = "账号密码登录失败: " + summarize_login_failures(login_errors)
+            else:
+                auth_fallback_reason = "账号密码登录失败: 无可用域名"
     if not cookie_str:
         return {"success": False, "error": "未配置账号密码或 Cookie", "domains": []}
     if auth_source == "未认证":
@@ -186,11 +184,22 @@ def cmd_sign():
     
     report_lines.append("-" * 30)
 
-    # 第一步：执行签到
+    # 第一步：执行签到(带失败分类的多级重试:退避重试→Cookie 失效重登录→换域名)
     with redirect_stdout(StringIO()):
-        sign_result = do_sign(domain, cookies, formhash)
+        sign_result, used_domain, cookies = retry_sign(cfg, domains, cookies, domain=domain)
+    if used_domain and used_domain != domain:
+        domain = used_domain
+        report_lines.append(f"切换域名: {domain}")
+    if "无法获取 formhash" in sign_result:
+        return {
+            "success": False,
+            "error": sign_result,
+            "report": "\n".join(report_lines),
+            "domains": domains,
+        }
 
     # 第二步：获取签到后的最新信息，判断是否断签
+    need_makeup = False
     with redirect_stdout(StringIO()):
         post_sign_info = get_sign_info(domain, cookies)
     if post_sign_info:
@@ -198,6 +207,7 @@ def cmd_sign():
         lxtdays = post_sign_info.get("lxtdays")
         # 判断断签：连续签到 1 天但总签到 > 1 天
         if lxdays and lxtdays and int(lxdays) == 1 and int(lxtdays) > 1:
+            need_makeup = True
             report_lines.append(f"检测到可能断签（连续 {lxdays} 天 / 总 {lxtdays} 天），尝试补签...")
             makeup_total = 0
             with redirect_stdout(StringIO()):
@@ -243,62 +253,82 @@ def cmd_sign():
                 report_lines.append("未找到可补签的日期，跳过补签")
             report_lines.append("-" * 30)
 
+    # 断签是否已恢复(供最终状态判定:成功 = 签到成功 + 连续签到达成)
+    makeup_ok = True
+    if need_makeup:
+        with redirect_stdout(StringIO()):
+            final_info = get_sign_info(domain, cookies)
+        lx_after = int(final_info.get("lxdays", 0)) if final_info else 0
+        lxt_after = int(final_info.get("lxtdays", 0)) if final_info else 0
+        makeup_ok = lx_after > 1 or lxt_after <= 1
+
     report_lines.append(f"完成时间: {beijing_now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # ---------- 状态界定 ----------
-    # 已签到:本次运行完成了签到(存在断签时已一并补签,综合结果同为"已签到")
-    # 今日已签到:今日已被签到过(非本次操作,避免同日多次触发时输出不明确)
-    # 签到失败:签到操作未成功
+    # ---------- 最终状态判定 ----------
+    # 成功 = 签到成功(含 Cookie 兜底)且连续签到达成(无断签或断签已补)
+    # 认证方式不影响结果:账号密码登录失败、Cookie 兜底签到成功同样是"签到成功"
+    final_state, conclusion, action_state = resolve_final_state(sign_result, need_makeup, makeup_ok)
+    final_result = conclusion
+
+    # 结论先行:插入报告首行,让邮件/控制台第一眼看到是否成功
+    report_lines.insert(0, conclusion + "\n")
     report_content = "\n".join(report_lines)
-    had_makeup = "补签成功" in report_content
-    if "✅ 签到成功" in sign_result:
-        current_state = SIGN_STATE_SIGNED
-        final_result = "✅ 已签到" + ("（含补签）" if had_makeup else "")
-    elif "⏭️" in sign_result or "今日已签" in sign_result:
-        current_state = SIGN_STATE_ALREADY
-        final_result = "⏭️ 今日已签到"
-    else:
-        current_state = SIGN_STATE_FAILED
-        final_result = f"❌ 签到失败：{sign_result}"
-    success = current_state in (SIGN_STATE_SIGNED, SIGN_STATE_ALREADY)
 
-    # 先读取旧状态（含日期），再保存新状态
-    last = load_last_sign_state()
-    prev_state = last.get("state", SIGN_STATE_NONE)
-    prev_date = last.get("date", "")
+    # 保存本次动作状态(env 模式下不落盘)
     with redirect_stdout(StringIO()):
-        save_last_sign_state(current_state)
+        save_last_sign_state(action_state)
 
-    # 仅本次运行完成签到(已签到)时发送邮件;今日已签到(重复触发)不重复发送
+    # ---------- 邮件通知 ----------
+    # 成功(success):发签到成功报告;失败(break/failed):发告警邮件
+    # 去重规则:
+    #   - 成功但本次无实际动作(纯重复触发 ALREADY 且无补签)且当日缓存已成功 → 不发
+    #   - 失败且当日缓存已是成功 → 不发(与"失败不覆盖当日成功缓存"一致,避免误报)
     today = beijing_now().strftime("%Y-%m-%d")
-    should_notify = (
-        current_state == SIGN_STATE_SIGNED
-        and (prev_state in (SIGN_STATE_NONE, SIGN_STATE_FAILED) or prev_date != today)
-    )
-    mail_note = "邮件通知: 未满足发送条件（重复签到或非成功状态）"
-    if should_notify:
-        email_cfg = cfg.get("email", {}) or {}
-        if not (email_cfg.get("sender") and email_cfg.get("password") and email_cfg.get("receivers")):
-            mail_note = "邮件通知: 未配置 SMTP，已跳过"
+    cache = load_sign_cache()
+    cache_success_today = bool(cache and cache.get("date") == today and cache.get("state") == SIGN_FINAL_SUCCESS)
+    acted = action_state == SIGN_STATE_SIGNED or (action_state == SIGN_STATE_ALREADY and need_makeup)
+    email_cfg = cfg.get("email", {}) or {}
+    mail_configured = bool(email_cfg.get("sender") and email_cfg.get("password") and email_cfg.get("receivers"))
+    mail_note = ""
+    if final_state == SIGN_FINAL_SUCCESS:
+        if acted or not cache_success_today:
+            if not mail_configured:
+                mail_note = "邮件通知: 未配置 SMTP，已跳过"
+            else:
+                with redirect_stdout(StringIO()):
+                    mail_ok = send_mail(
+                        cfg,
+                        f"每日签到 - {beijing_now().strftime('%m/%d')}",
+                        sanitize_report_for_mail(report_content),
+                    )
+                mail_note = "邮件通知: 已发送" if mail_ok else "邮件通知: 发送失败（请检查 SMTP 配置/授权码/网络）"
         else:
-            with redirect_stdout(StringIO()):
-                mail_ok = send_mail(
-                    cfg,
-                    f"每日签到 - {beijing_now().strftime('%m/%d')}",
-                    sanitize_report_for_mail(report_content),
-                )
-            mail_note = "邮件通知: 已发送" if mail_ok else "邮件通知: 发送失败（请检查 SMTP 配置/授权码/网络）"
+            mail_note = "邮件通知: 重复触发且当日已成功，未发送"
+    else:
+        if cache_success_today:
+            mail_note = "邮件通知: 当日已签到成功，失败不打扰"
+        else:
+            if not mail_configured:
+                mail_note = "邮件通知(告警): 未配置 SMTP，已跳过（签到失败，请及时处理）"
+            else:
+                with redirect_stdout(StringIO()):
+                    mail_ok = send_mail(
+                        cfg,
+                        f"签到失败告警 - {beijing_now().strftime('%m/%d')}",
+                        sanitize_report_for_mail(report_content),
+                    )
+                mail_note = "邮件通知(告警): 已发送" if mail_ok else "邮件通知(告警): 发送失败（请检查 SMTP 配置）"
     report_lines.append(mail_note)
     report_lines.append(f"结果: {final_result}")
     report_content = "\n".join(report_lines)
 
     # 当日签到结果写入缓存(成功覆盖失败,失败不覆盖当日成功记录)
     with redirect_stdout(StringIO()):
-        save_sign_cache(current_state, final_result, report_content, domains)
+        save_sign_cache(final_state, final_result, report_content, domains)
 
     return {
-        "success": success,
-        "state": current_state,
+        "success": final_state == SIGN_FINAL_SUCCESS,
+        "state": final_state,
         "result": final_result,
         "report": report_content,
         "domains": domains,
