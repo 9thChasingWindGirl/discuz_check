@@ -16,8 +16,8 @@ on:
           - send_mail
 
 permissions:
-  contents: read
-  # 写回 SJS_DOMAINS Variable 需要 actions: write 权限
+  # keepalive-workflow 需要推空提交；写回 SJS_DOMAINS Variable 需要 actions: write
+  contents: write
   actions: write
 
 # job 级环境变量:Secrets / Variables 直接注入进程,
@@ -43,6 +43,14 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+
+      # 防止 60 天无 commit 导致 GitHub 自动停用 scheduled workflow：
+      # 距上次提交约 50 天时自动推一个 dummy commit 重置计时器
+      - name: Keepalive（防止定时任务被 60 天不活跃规则停用）
+        uses: gautamkrishnar/keepalive-workflow@v2
+        with:
+          # 使用 GITHUB_TOKEN 即可；默认只推空提交（null commit），不产生垃圾提交记录
+          use_api: true
 
       - name: 安装 Python
         uses: actions/setup-python@v5
@@ -77,6 +85,67 @@ jobs:
           print("----")
           EOF
           echo "domains=$(python -c "import json;print(','.join(json.load(open('/tmp/sign_result.json')).get('domains', [])))")" >> "$GITHUB_OUTPUT"
+
+      # 将本次签到结果写入 docs/sign_records.md 并 commit 回仓库:
+      # 既保留格式化的历史签到记录(可在仓库直接查看),又让每次运行产生真实 commit,
+      # 避免"60 天无 commit 被 GitHub 停用 scheduled workflow"
+      - name: 写回签到活动记录到仓库
+        if: always() && (inputs.mode == '' || inputs.mode == 'sign') && steps.sign.outcome != 'skipped'
+        run: |
+          python - <<'EOF'
+          import json, os
+          from pathlib import Path
+
+          result_path = Path('/tmp/sign_result.json')
+          record_path = Path('docs/sign_records.md')
+          if not result_path.exists():
+              print("::warning::未找到签到结果 JSON,跳过记录写回")
+              raise SystemExit(0)
+
+          d = json.loads(result_path.read_text(encoding='utf-8'))
+          state = d.get('state', 'failed')
+          result = (d.get('result', '') or '').replace('|', '\\|').replace('\n', ' ')
+          domains = d.get('domains', []) or []
+          icon = {'success': '✅', 'break': '⚠️', 'failed': '❌'}.get(state, '❓')
+          state_label = {'success': '成功', 'break': '断签', 'failed': '失败'}.get(state, state)
+          # 记录时间:按北京时间生成
+          from datetime import datetime, timezone, timedelta
+          ts = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')
+
+          header = [
+              '# 签到活动记录',
+              '',
+              '> 由 GitHub Actions 每次签到后自动写回,仅保留最近 100 条。',
+              '',
+              '| 时间(UTC+8) | 状态 | 结果 | 域名数 |',
+              '|---|---|---|---|',
+          ]
+          lines = header[:]
+          if record_path.exists():
+              old = record_path.read_text(encoding='utf-8').splitlines()
+              # 复用旧表头之前的标题,仅提取表格数据行(以 | 开头且非表头分隔)
+              for line in old:
+                  s = line.strip()
+                  if s.startswith('|') and not s.startswith('|---') and not s.startswith('| 时间'):
+                      lines.append(s)
+          lines.append(f'| {ts} | {icon} {state_label} | {result} | {len(domains)} |')
+          # 裁剪到最近 100 条数据行
+          data_rows = lines[len(header):]
+          if len(data_rows) > 100:
+              data_rows = data_rows[-100:]
+          record_path.parent.mkdir(parents=True, exist_ok=True)
+          record_path.write_text('\n'.join(header + data_rows) + '\n', encoding='utf-8')
+          print(f"已写入签到记录: {ts} {state_label}")
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/sign_records.md
+          if git diff --cached --quiet; then
+            echo "记录无变化,跳过提交"
+          else
+            git commit -m "docs(sign): 记录 $(TZ=UTC-8 date '+%Y-%m-%d %H:%M') 签到结果"
+            git push
+          fi
 
       # 将本次探寻到的域名列表写回仓库 Variable SJS_DOMAINS,供下次运行作为种子
       # 变量不存在时自动创建;写回失败不阻断签到结果,仅告警
