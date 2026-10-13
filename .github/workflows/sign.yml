@@ -44,14 +44,7 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      # 防止 60 天无 commit 导致 GitHub 自动停用 scheduled workflow：
-      # 距上次提交约 50 天时自动推一个 dummy commit 重置计时器
-      - name: Keepalive（防止定时任务被 60 天不活跃规则停用）
-        uses: gautamkrishnar/keepalive-workflow@v2
-        with:
-          # 使用 GITHUB_TOKEN 即可；默认只推空提交（null commit），不产生垃圾提交记录
-          use_api: true
-
+      # 防 60 天不活跃停用:由下方"写回签到活动记录到仓库"步骤每次产生真实 commit 实现
       - name: 安装 Python
         uses: actions/setup-python@v5
         with:
